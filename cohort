@@ -1,0 +1,498 @@
+# Cloudflare Workers — Cohort-Based Deployments Explained
+
+A plain-english breakdown of cohort-based deployments in Cloudflare Workers,
+covering every concept from scratch.
+
+-----
+
+## What problem does this solve?
+
+Normal gradual deployments send a random percentage of traffic to a new version.
+The same user might hit v1 one request and v2 the next. That’s unpredictable.
+
+Cohort deployments let you say: **specific groups of users always get a specific version.**
+
+```
+Normal gradual deployment:
+  All traffic
+    ├── 90% ──► v1 (stable)
+    └── 10% ──► v2 (new)   ← random, any user could land here
+
+Cohort deployment:
+  All traffic
+    ├── No cohort (default) ──► 100% v1
+    ├── "canary" cohort     ──► 100% v2
+    └── "enterprise" cohort ──► 100% v1   ← pinned, never random
+```
+
+-----
+
+## Key concepts
+
+### Versions array
+
+A list of which Worker versions exist and what % of traffic goes to each:
+
+```json
+"versions": [
+  { "version_id": "abc123-stable", "percentage": 90 },
+  { "version_id": "def456-new",    "percentage": 10 }
+]
+```
+
+Every cohort has its own independent versions array. Percentages within each must sum to 100.
+
+### Cohorts array
+
+A list of named groups, each with their own versions array:
+
+```json
+"cohorts": [
+  {
+    "name": "canary",
+    "versions": [
+      { "version_id": "abc123-stable", "percentage": 50 },
+      { "version_id": "def456-new",    "percentage": 50 }
+    ]
+  },
+  {
+    "name": "ent",
+    "versions": [
+      { "version_id": "abc123-stable", "percentage": 100 }
+    ]
+  }
+]
+```
+
+Cohorts are completely independent — changing canary’s split doesn’t affect ent or the default.
+
+-----
+
+## How routing works (decision tree)
+
+Every incoming request goes through this flow:
+
+```
+Incoming request
+        │
+        ▼
+Has Cloudflare-Workers-Version-Overrides header?
+  YES ──► use that exact version. done. skip everything else.
+  NO
+        │
+        ▼
+Has Cloudflare-Workers-Cohort header matching a cohort name?
+  YES ──► use that cohort's versions array
+  NO  ──► use the default versions array
+        │
+        ▼
+Has Cloudflare-Workers-Version-Key header?
+  YES ──► deterministic hash pick from the chosen versions array (sticky)
+  NO  ──► random weighted pick from the chosen versions array
+```
+
+### The three headers explained simply
+
+|Header                                |What it does                              |Who uses it             |
+|--------------------------------------|------------------------------------------|------------------------|
+|`Cloudflare-Workers-Version-Overrides`|Skip all routing, go to this exact version|Developers / QA testing |
+|`Cloudflare-Workers-Cohort`           |Use this cohort’s versions array          |Your infra / Worker code|
+|`Cloudflare-Workers-Version-Key`      |Always pick the same version for this key |Session consistency     |
+
+**Priority order:** Override > Cohort > Default. More specific always wins.
+
+-----
+
+## What is the Version-Overrides header?
+
+A “master key” for developers to force a specific version, bypassing all routing rules:
+
+```sh
+curl https://example.com \
+  -H 'Cloudflare-Workers-Version-Overrides: def456-new-version'
+```
+
+Cloudflare finds that version ID anywhere in your deployment (default or any cohort)
+and routes directly to it. Used internally by devs and QA — never by real users.
+
+-----
+
+## What is the Version-Key header / sticky sessions?
+
+**The problem:** A user makes a request, hits v2, fills out half a form.
+Next request randomly hits v1. v1 doesn’t know about their form. Things break.
+
+**Sticky session** = same user always hits the same version, every request.
+
+**How it works:**
+
+```
+Cloudflare-Workers-Version-Key: user_12345
+
+Cloudflare hashes "user_12345" → always produces the same version pick
+
+user_12345 ──► hash ──► always v1
+user_67890 ──► hash ──► always v2
+```
+
+You set this to a user ID or session ID. Only needed when you have a percentage
+split AND need consistency. If a cohort is already 100% one version, you don’t need it.
+
+-----
+
+## Two ways to assign cohorts to requests
+
+### Way 1 — Gateway Entrypoint Pattern (Worker figures it out in code)
+
+Your Worker reads the request, looks up the user in your database, decides the cohort,
+then calls itself again with the cohort attached.
+
+```
+Request arrives (no cohort info)
+        │
+        ▼
+export default runs (front door)
+  reads account ID from request
+  calls database: "what plan is this user?"
+  database says: "enterprise"
+  cohort = "ent"
+        │
+        │  ctx.exports.Service({ version: { cohort: "ent" } })
+        ▼
+Cloudflare boots a fresh invocation on the "ent" version
+        │
+        ▼
+export class Service runs (does the actual work)
+on the correct version ✅
+```
+
+**Why the two-step with ctx.exports.Service?**
+
+`export default` is already running on some version when it figures out the cohort.
+You can’t change versions mid-execution. So it hands off to a second entrypoint,
+telling Cloudflare the cohort BEFORE that second invocation boots — so it starts
+on the right version from the beginning.
+
+```
+export default  = detective. only job is to figure out the cohort. no real work.
+export Service  = does the actual work. always runs on the correct version.
+```
+
+**The code:**
+
+```ts
+import { WorkerEntrypoint } from "cloudflare:workers";
+
+// Front door — figures out cohort, hands off
+export default {
+  async fetch(request, env, ctx) {
+    const accountId = request.headers.get("cf-account-id");
+
+    const cohort = accountId
+      ? resolveCohortFromAccountId(request, env, accountId)
+      : resolveCohortFromUrl(request, env);
+
+    return ctx.exports.Service({ version: { cohort } }).handle(request);
+  }
+};
+
+// Cohort resolution logic — your business rules
+function resolveCohortFromAccountId(request, env, accountId) {
+  const plan = lookupAccountPlan(accountId, env);
+
+  if (isEmployee(request))    return "employee";
+  if (plan === "free")        return "free";
+  if (plan === "enterprise")  return "ent";
+  return "paid";
+}
+
+// Fallback — resolve from URL if no account ID
+function resolveCohortFromUrl(request, env) {
+  const url = new URL(request.url);
+  const hostname = url.hostname;
+  const accountMatch = hostname.match(/^([a-f0-9]+)\.r2\.cloudflarestorage\.com$/i);
+
+  if (!accountMatch) return "ent"; // safe default
+  const accountId = accountMatch[1];
+  const plan = lookupAccountPlan(accountId, env);
+
+  if (plan === "free") return "free";
+  return "paid";
+}
+
+// Side door — does the actual work on the correct version
+export class Service extends WorkerEntrypoint {
+  async handle(request) {
+    // your real Worker logic goes here
+  }
+}
+```
+
+**Required in wrangler.toml:**
+
+```toml
+compatibility_flags = ["enable_ctx_exports"]
+```
+
+**When to use this:** When cohort logic requires your database or app knowledge.
+The request has no cohort info — your Worker figures it all out internally.
+
+-----
+
+### Way 2 — External Cohort Header (something upstream labels the request)
+
+The `Cloudflare-Workers-Cohort` header is set BEFORE the request reaches your Worker.
+Your Worker code doesn’t need any special logic — routing happens at the infra level.
+
+#### Option A: Client sets it directly (testing only)
+
+```sh
+curl https://example.com -H 'Cloudflare-Workers-Cohort: canary'
+```
+
+Never use this in production — anyone can fake their cohort.
+
+#### Option B: Cloudflare Transform Rule (no code changes)
+
+The client makes a normal request with a cookie. A Transform Rule reads the cookie
+and adds the cohort header automatically.
+
+```
+Browser sends:
+  Cookie: session=abc123; cohort=canary; theme=dark
+
+Transform Rule runs:
+  reads cookie → extracts "canary" → adds header
+
+Your Worker receives:
+  Cookie: session=abc123; cohort=canary; theme=dark
+  Cloudflare-Workers-Cohort: canary   ← Cloudflare added this
+```
+
+Dashboard setup:
+
+```
+Rules → Transform Rules → Create rule
+
+IF:    http.cookie contains "cohort="
+THEN:  Set dynamic request header
+       Name:  Cloudflare-Workers-Cohort
+       Value: regex_replace(http.cookie, ".*cohort=([^;]+).*", "${1}")
+```
+
+How the cookie gets there in the first place — your login endpoint sets it:
+
+```js
+// when user logs in on your backend
+const plan = await getUserPlan(user.id);
+const cohort = plan === "enterprise" ? "ent" : "canary";
+
+response.headers.set("Set-Cookie",
+  `cohort=${cohort}; Path=/; Max-Age=2592000; HttpOnly`
+);
+```
+
+Now every request from that browser automatically carries the cohort cookie.
+
+#### Option C: Upstream “bouncer” Worker (most secure)
+
+A separate Worker authenticates the user, decides their cohort from trusted
+server-side data, and stamps the header before forwarding.
+
+```
+User request (no header, or spoofed header)
+        │
+        ▼
+Auth Worker (bouncer)
+  authenticates user
+  looks up real plan
+  overwrites header with correct cohort
+        │
+        ▼
+Main Worker
+  receives trustworthy Cloudflare-Workers-Cohort header
+  routes to correct version ✅
+```
+
+```js
+// auth Worker
+export default {
+  async fetch(request, env) {
+    const user = await authenticateUser(request);
+    const cohort = user.isBetaTester ? "canary" : "ent";
+
+    // clone request (Request objects are immutable — can't modify in place)
+    const modifiedRequest = new Request(request, {
+      headers: new Headers(request.headers)
+    });
+    modifiedRequest.headers.set("Cloudflare-Workers-Cohort", cohort);
+
+    return env.DOWNSTREAM_SERVICE.fetch(modifiedRequest);
+  }
+};
+```
+
+wrangler.toml for auth Worker:
+
+```toml
+[[services]]
+binding = "DOWNSTREAM_SERVICE"
+service = "your-main-worker-name"
+```
+
+-----
+
+## Accessing cohort info inside your Worker
+
+After routing happens, you can read how the request was routed via `ctx.version`:
+
+```ts
+export default {
+  async fetch(request, env, ctx) {
+    const { cohort, override, key, metadata } = ctx.version;
+
+    // cohort:   which cohort header was matched ("canary", "ent", etc.)
+    // override: version ID if an override header was used
+    // key:      version key if a version-key header was used
+    // metadata: { id, tag, timestamp } of the running version
+
+    console.log(`cohort: ${cohort}, version: ${metadata.id}`);
+  }
+};
+```
+
+Use this for logging and observability. If you see `cohort: undefined` for a user
+who should have a cohort, something broke in your setup.
+
+-----
+
+## Making it reliable in production
+
+### Always default to your safest version
+
+```js
+function resolveCohort(request, user) {
+  if (!user)                  return "ent"; // not logged in → safest default
+  if (user.plan === "enterprise") return "ent";
+  if (user.isBetaTester)      return "canary";
+  return "free";
+}
+```
+
+When in doubt, give users the stable version — not the experimental one.
+
+### Wrap database lookups in try/catch
+
+```js
+async function resolveCohort(accountId, env) {
+  try {
+    const plan = await lookupAccountPlan(accountId, env);
+    if (plan === "enterprise") return "ent";
+    return "paid";
+  } catch (error) {
+    console.error("cohort lookup failed:", error);
+    return "ent"; // fail safe — never fail open to canary
+  }
+}
+```
+
+### Make sure your default versions array is also your stable version
+
+Even if all cohort routing fails completely, requests fall back to the default.
+Make sure that default also points to stable, not canary:
+
+```json
+"versions": [
+  { "version_id": "abc123-stable", "percentage": 100 }
+]
+```
+
+-----
+
+## Setup checklist — from zero to working
+
+```
+Step 1: Deploy v1 of your Worker
+        wrangler deploy
+
+Step 2: Make changes, deploy v2
+        wrangler deploy
+
+Step 3: Call Cloudflare API to create the cohort deployment
+        (maps cohort names → version IDs, sets percentages)
+
+Step 4: Pick your approach and set it up:
+
+        Gateway Entrypoint?
+        □ Write cohort resolution logic in your Worker
+        □ Add enable_ctx_exports to wrangler.toml
+        □ Add export class Service extends WorkerEntrypoint
+        □ Deploy
+
+        Transform Rule?
+        □ Set cohort cookie in your login endpoint (backend)
+        □ Create Transform Rule in Cloudflare dashboard
+        □ Test that cookie → header flow works
+
+        Upstream Worker?
+        □ Build auth Worker with cohort stamping logic
+        □ Add Service Binding in wrangler.toml
+        □ Point your domain at the auth Worker
+        □ Deploy both Workers
+
+Step 5: Add logging
+        console.log(ctx.version.cohort)
+
+Step 6: Verify in logs that users are hitting the right cohorts
+```
+
+-----
+
+## Limitations to know about
+
+|Limit                                          |Value                             |
+|-----------------------------------------------|----------------------------------|
+|Max cohorts per deployment                     |5                                 |
+|Max unique version IDs across entire deployment|2                                 |
+|Max cohort name length                         |10 characters                     |
+|Allowed characters in cohort name              |Alphanumeric, hyphens, underscores|
+
+**The 2 unique version ID limit** means you can have 5 cohorts but they all have
+to reference the same 2 versions. You can split traffic between those 2 versions
+differently per cohort, but you can’t introduce a 3rd distinct version anywhere.
+
+**Service bindings** — cohort routing doesn’t propagate. If your Worker calls
+another Worker via a service binding, that second Worker uses its own deployment
+config independently. The cohort header is not forwarded automatically.
+
+**Durable Objects** — completely ignore cohort headers. They follow their own
+versioning rules based on when they were first created.
+
+**Runtime fallback** — if the cohort header value doesn’t match any defined cohort,
+the request silently falls back to the default versions array. No error is thrown.
+This is why logging `ctx.version.cohort` matters — misconfigurations won’t surface
+as errors, they’ll just silently misroute.
+
+-----
+
+## The mental model in one diagram
+
+```
+Deployment config (set via API):
+  default:    [v1 100%]
+  canary:     [v1 50%, v2 50%]
+  enterprise: [v1 100%]
+
+Request arrives:
+  Override header? ──► exact version, done
+  Cohort header?   ──► use that cohort's pool
+  Nothing?         ──► use default pool
+          │
+          ▼
+  Version-Key header? ──► deterministic pick from pool
+  Nothing?            ──► random weighted pick from pool
+          │
+          ▼
+  Request hits correct version of your Worker
+  ctx.version tells you how it got there
+```
